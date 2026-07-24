@@ -1,13 +1,12 @@
 import { useState, useEffect } from "react";
 import {
-    createAccountsProvider,
-    preimageManager,
+    getAccountsProvider,
+    getHostProvider,
+    getPreimageManager,
     requestPermission,
-    createPapiProvider,
-    sandboxTransport,
+    type AccountsProvider,
     type ProductAccount,
-} from "@novasamatech/host-api-wrapper";
-import { RequestCredentialsErr } from "@novasamatech/host-api";
+} from "@parity/product-sdk-host";
 import { ContractManager, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
 import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
 import { ss58ToH160 } from "@parity/product-sdk-address";
@@ -34,11 +33,11 @@ async function ensurePermission(tag: "ChainSubmit" | "PreimageSubmit" | "Stateme
     if (_grantedPermissions.has(tag)) return;
     try {
         const result = await requestPermission({ tag, value: undefined });
-        if (result.isOk() && result.value) {
+        if (result.ok && result.value) {
             _grantedPermissions.add(tag);
             console.log(`[Permission] ${tag} granted`);
         } else {
-            console.warn(`[Permission] ${tag} denied`, result.isErr() ? result.error : "user rejected");
+            console.warn(`[Permission] ${tag} denied`, result.ok ? "user rejected" : result.error);
         }
     } catch (err) {
         console.warn(`[Permission] ${tag} request failed:`, err);
@@ -49,7 +48,14 @@ async function ensurePermission(tag: "ChainSubmit" | "PreimageSubmit" | "Stateme
 // Account flow — direct against product-sdk (matches t3rminal / RPS pattern).
 // ---------------------------------------------------------------------------
 
-const accountsProvider = createAccountsProvider(sandboxTransport);
+// Lazy: the provider handshakes with the host on first use and is null when
+// the app runs outside a host container.
+let _accountsProvider: AccountsProvider | null | undefined;
+async function getProvider(): Promise<AccountsProvider | null> {
+    if (_accountsProvider === undefined) _accountsProvider = await getAccountsProvider();
+    return _accountsProvider;
+}
+
 const accountIdCodec = AccountId();
 
 /**
@@ -114,32 +120,48 @@ export async function connectAccount(): Promise<void> {
         const [identifier, derivationIndex] = getAppAccountId();
         console.log(`[Account] Requesting product account ${identifier}#${derivationIndex}`);
 
-        const result = await accountsProvider.getProductAccount(identifier, derivationIndex);
+        const provider = await getProvider();
+        if (!provider) {
+            setState({
+                status: "error",
+                account: null,
+                error: "Host unavailable — open this app inside a Polkadot host.",
+            });
+            return;
+        }
+
+        const result = await provider.getProductAccount(identifier, derivationIndex);
         if (result.isErr()) {
-            if (result.error instanceof RequestCredentialsErr.NotConnected) {
+            // Errors arrive as truapi's CallErrorValue envelope: domain errors
+            // (e.g. NotConnected = not signed in) are wrapped as
+            // { tag: "Domain", value: { tag: "V1", value: <domain error> } }.
+            const error = result.error;
+            const domain = error.tag === "Domain" ? (error.value as any)?.value : null;
+            if (domain?.tag === "NotConnected") {
                 setState({ status: "signed-out", account: null });
                 return;
             }
-            const errMsg = `${(result.error as any)?.tag ?? "Unknown"}: ${(result.error as any)?.value?.reason ?? String(result.error)}`;
+            const errMsg = `${domain?.tag ?? error.tag}: ${domain?.value?.reason ?? (error as any)?.value?.reason ?? "request failed"}`;
             console.warn("[Account] getProductAccount error:", errMsg);
             setState({ status: "error", account: null, error: errMsg });
             return;
         }
 
-        const { publicKey } = result.value;
-        const productAccount: ProductAccount = { dotNsIdentifier: identifier, derivationIndex, publicKey };
-        // "createTransaction" signerType routes through the host's
-        // `host_create_transaction` RPC, the only path that signs Paseo Next v2's
-        // pallet-revive signed extensions (AsPgas, AsRingAlias, …).
-        const signer = accountsProvider.getProductAccountSigner(productAccount, "createTransaction");
+        // The provider returns the full product account (id + publicKey bytes).
+        const productAccount: ProductAccount = result.value;
+        const { publicKey } = productAccount;
+        // The signer routes through the host's `createTransaction` path, the only
+        // path that signs Paseo Next v2's pallet-revive signed extensions
+        // (AsPgas, AsRingAlias, …).
+        const signer = provider.getProductAccountSigner(productAccount);
         const ss58 = accountIdCodec.dec(publicKey);
         const h160Address = ss58ToH160(ss58 as never) as `0x${string}`;
 
         let displayName: string | null = null;
         try {
-            const userIdResult = await accountsProvider.getUserId();
+            const userIdResult = await provider.getUserId();
             if (userIdResult.isOk()) {
-                displayName = (userIdResult.value as any).primaryUsername ?? null;
+                displayName = userIdResult.value.primaryUsername ?? null;
             }
         } catch { /* optional */ }
 
@@ -169,9 +191,10 @@ export async function connectAccount(): Promise<void> {
     }
 }
 
-/** Open dotli's sign-in UI and refresh the account on success. */
+/** Open the host's sign-in UI and refresh the account on success. */
 export async function signIn(): Promise<void> {
-    await accountsProvider.requestLogin("Sign in to use Surveys");
+    const provider = await getProvider();
+    if (provider) await provider.requestLogin("Sign in to use Surveys");
     await connectAccount();
 }
 
@@ -213,6 +236,10 @@ export async function uploadToBulletin(bytes: Uint8Array): Promise<string> {
     await ensurePermission("PreimageSubmit");
     const cid = calculateCID(bytes);
     console.log("[Bulletin] Submitting preimage via host, size:", bytes.length, "expected CID:", cid);
+    const preimageManager = await getPreimageManager();
+    if (!preimageManager) {
+        throw new Error("Preimage manager unavailable — open this app inside a Polkadot host.");
+    }
     await preimageManager.submit(bytes);
     console.log("[Bulletin] Preimage stored.");
     return cid;
@@ -300,16 +327,22 @@ async function ensureContractsReady(): Promise<void> {
 
         // Asset Hub access:
         //  - In dev (localhost) the host refuses to open a chain follow for the
-        //    unregistered domain, so `createPapiProvider` traps and the WS
-        //    fallback never fires. Bypass and go straight to WS.
+        //    unregistered domain. Bypass and go straight to WS.
         //  - In a deployed `*.dot` app the host owns the follow; route through
-        //    `createPapiProvider` so signing/permissions stay coordinated.
+        //    the host provider so signing/permissions stay coordinated, and fall
+        //    back to WS if the host can't serve the chain.
         const isDevHost =
             typeof window !== "undefined" && /^localhost(:\d+)?$/.test(window.location.host);
 
-        const provider = isDevHost
-            ? getWsProvider(PASEO_ASSET_HUB_WS)
-            : createPapiProvider(PASEO_ASSET_HUB_GENESIS, getWsProvider(PASEO_ASSET_HUB_WS));
+        let provider = null;
+        if (!isDevHost) {
+            try {
+                provider = await getHostProvider(PASEO_ASSET_HUB_GENESIS);
+            } catch (err) {
+                console.warn("[CDM] Host provider failed, falling back to WS:", err);
+            }
+        }
+        provider ??= getWsProvider(PASEO_ASSET_HUB_WS);
         console.log(`[CDM] Asset Hub provider: ${isDevHost ? "direct WS (dev)" : "host with WS fallback (prod)"}`);
         _polkadotClient = createClient(provider);
 
@@ -336,6 +369,10 @@ async function ensureContractsReady(): Promise<void> {
  * Lazy contract handle. The chain client doesn't spin up until a method is
  * actually called. `getContract().method.query(...)` returns `{ success, value }`;
  * `.tx(...)` submits with the account defaults set on connect.
+ *
+ * Since product-sdk 0.18, `.tx(...)` returns a `Result` instead of throwing.
+ * Unwrap it here (re-throw the `err` channel) so the existing try/catch flow
+ * at every call site keeps working. `.query(...)` is unchanged upstream.
  */
 export function getContract(): any {
     if (!_cdmJson) return null;
@@ -349,7 +386,12 @@ export function getContract(): any {
                         if (!_contract) throw new Error("Contract init failed");
                         const real = _contract[prop as string];
                         if (!real) throw new Error(`Unknown method: ${String(prop)}`);
-                        return real[methodProp](...args);
+                        const outcome = await real[methodProp](...args);
+                        if (methodProp === "tx") {
+                            if (!outcome.ok) throw outcome.error;
+                            return outcome.value;
+                        }
+                        return outcome;
                     };
                 },
             });
@@ -369,25 +411,24 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
     if (_mappedAccounts.has(account.address)) return;
     await ensureContractsReady();
     if (!_contractManager) throw new Error("Contract manager not ready");
-    try {
-        const mapped = await ensureContractAccountMapped(
-            _contractManager.getRuntime(),
-            account.address as never,
-            account.signer,
-        );
-        if (mapped === null) {
-            console.log(`[Revive] Account ${account.address} already mapped`);
-        } else {
-            console.log(`[Revive] Account mapped in block #${mapped.block.number}`);
+    const mapped = await ensureContractAccountMapped(
+        _contractManager.getRuntime(),
+        account.address as never,
+        account.signer,
+    );
+    if (!mapped.ok) {
+        console.error("[Revive] ensureContractAccountMapped failed:", mapped.error);
+        if (mapped.error.cause) {
+            console.error("[Revive] underlying cause:", mapped.error.cause);
         }
-        _mappedAccounts.add(account.address);
-    } catch (err) {
-        console.error("[Revive] ensureContractAccountMapped failed:", err);
-        if (err && typeof err === "object" && "cause" in err) {
-            console.error("[Revive] underlying cause:", (err as any).cause);
-        }
-        throw err;
+        throw mapped.error;
     }
+    if (mapped.value === null) {
+        console.log(`[Revive] Account ${account.address} already mapped`);
+    } else {
+        console.log(`[Revive] Account mapped in block #${mapped.value.block.number}`);
+    }
+    _mappedAccounts.add(account.address);
 }
 
 // ---------------------------------------------------------------------------

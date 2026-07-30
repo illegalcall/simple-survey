@@ -19,9 +19,26 @@ import type { MultihashDigest } from "multiformats/hashes/interface";
 
 const CONTRACT_KEY = "@example/surveys";
 
-// Paseo Next v2 — see @parity/product-sdk 0.4.0 CHANGELOG. v1 retired 2026-05-20.
-const PASEO_ASSET_HUB_GENESIS = "0x173cea9df45656cf612c8b8ece56e04e9a693c69cfaac47d3628dae735067af8" as const;
+// Paseo Next v2. The genesis comes from the descriptor so it tracks chain
+// resets with the descriptors package instead of going stale (the old
+// hardcoded constant predated the 2026-06-02 reset).
+const PASEO_ASSET_HUB_GENESIS = paseo_asset_hub.genesis as `0x${string}`;
 const PASEO_ASSET_HUB_WS = "wss://paseo-asset-hub-next-rpc.polkadot.io";
+
+/**
+ * Unwrap a product-sdk `Result` to its value, re-throwing the `err` channel as
+ * an `Error`. Since product-sdk 0.18 fallible calls return `Result` instead of
+ * throwing; this bridges them back onto throw / try-catch control flow. Mirrors
+ * the CLI's `unwrapResult` (playground-cli #470).
+ */
+export function unwrapResult<T>(
+    result: { ok: true; value: T } | { ok: false; error: unknown },
+): T {
+    if (!result.ok) {
+        throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
+    return result.value;
+}
 
 // ---------------------------------------------------------------------------
 // Permissions (RFC-0002)
@@ -387,11 +404,7 @@ export function getContract(): any {
                         const real = _contract[prop as string];
                         if (!real) throw new Error(`Unknown method: ${String(prop)}`);
                         const outcome = await real[methodProp](...args);
-                        if (methodProp === "tx") {
-                            if (!outcome.ok) throw outcome.error;
-                            return outcome.value;
-                        }
-                        return outcome;
+                        return methodProp === "tx" ? unwrapResult(outcome) : outcome;
                     };
                 },
             });
@@ -411,24 +424,30 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
     if (_mappedAccounts.has(account.address)) return;
     await ensureContractsReady();
     if (!_contractManager) throw new Error("Contract manager not ready");
-    const mapped = await ensureContractAccountMapped(
-        _contractManager.getRuntime(),
-        account.address as never,
-        account.signer,
-    );
-    if (!mapped.ok) {
-        console.error("[Revive] ensureContractAccountMapped failed:", mapped.error);
-        if (mapped.error.cause) {
-            console.error("[Revive] underlying cause:", mapped.error.cause);
+    try {
+        // Since product-sdk 0.18, ensureContractAccountMapped returns a Result
+        // (ok(null) = already mapped) instead of throwing. Unwrap it so the
+        // catch handles both a returned `err` and any thrown failure with the
+        // same cause-chain logging.
+        const mapped = unwrapResult(
+            await ensureContractAccountMapped(
+                _contractManager.getRuntime(),
+                account.address as never,
+                account.signer,
+            ),
+        );
+        if (mapped === null) {
+            console.log(`[Revive] Account ${account.address} already mapped`);
+        } else {
+            console.log(`[Revive] Account mapped in block #${mapped.block.number}`);
         }
-        throw mapped.error;
+        _mappedAccounts.add(account.address);
+    } catch (err) {
+        console.error("[Revive] ensureContractAccountMapped failed:", err);
+        const cause = err && typeof err === "object" ? (err as { cause?: unknown }).cause : undefined;
+        if (cause) console.error("[Revive] underlying cause:", cause);
+        throw err;
     }
-    if (mapped.value === null) {
-        console.log(`[Revive] Account ${account.address} already mapped`);
-    } else {
-        console.log(`[Revive] Account mapped in block #${mapped.value.block.number}`);
-    }
-    _mappedAccounts.add(account.address);
 }
 
 // ---------------------------------------------------------------------------

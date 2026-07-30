@@ -7,8 +7,9 @@ import {
     type AccountsProvider,
     type ProductAccount,
 } from "@parity/product-sdk-host";
-import { ContractManager, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
-import { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
+import { ContractManager, QUERY_FALLBACK_ORIGIN, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
+import type { devnet_asset_hub } from "@parity/product-sdk-descriptors/devnet-asset-hub";
+import type { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
 import { ss58ToH160 } from "@parity/product-sdk-address";
 import { createClient, AccountId, type PolkadotSigner } from "polkadot-api";
 import { getWsProvider } from "@polkadot-api/ws-provider";
@@ -19,11 +20,69 @@ import type { MultihashDigest } from "multiformats/hashes/interface";
 
 const CONTRACT_KEY = "@example/surveys";
 
-// Paseo Next v2. The genesis comes from the descriptor so it tracks chain
-// resets with the descriptors package instead of going stale (the old
-// hardcoded constant predated the 2026-06-02 reset).
-const PASEO_ASSET_HUB_GENESIS = paseo_asset_hub.genesis as `0x${string}`;
-const PASEO_ASSET_HUB_WS = "wss://paseo-asset-hub-next-rpc.polkadot.io";
+// ---------------------------------------------------------------------------
+// Networks. "paseo-next" is the Paseo Next v2 preview network (para 1500) —
+// that's what the CDM `paseo` preset targets, NOT the public Paseo testnet.
+// "devnet" is the public products devnet on the Paseo testnet Asset Hub
+// (para 1000), with the community-operated CDM registry (reference:
+// contract-dependency-manager PR #61). Build with VITE_NETWORK=devnet to
+// select it; the default stays paseo-next. Descriptors load dynamically so
+// each build ships a single metadata chunk, and the genesis always comes
+// from the descriptor so it tracks chain resets with the package.
+// ---------------------------------------------------------------------------
+
+type AssetHubDescriptor = typeof devnet_asset_hub | typeof paseo_asset_hub;
+
+interface NetworkConfig {
+    label: string;
+    assetHubWs: string;
+    /** IPFS gateways used to read Bulletin content, most specific first. */
+    gateways: readonly string[];
+    /** CDM ContractRegistry address the contract resolves against. */
+    registry: string;
+    loadDescriptor(): Promise<AssetHubDescriptor>;
+}
+
+const NETWORKS: Record<"paseo-next" | "devnet", NetworkConfig> = {
+    "paseo-next": {
+        label: "Paseo Next",
+        assetHubWs: "wss://paseo-asset-hub-next-rpc.polkadot.io",
+        gateways: [
+            "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs/",
+            "https://dweb.link/ipfs/",
+            "https://ipfs.io/ipfs/",
+            "https://nftstorage.link/ipfs/",
+        ],
+        registry: "0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0",
+        loadDescriptor: async () =>
+            (await import("@parity/product-sdk-descriptors/paseo-asset-hub")).paseo_asset_hub,
+    },
+    // Bulletin Paseo has no dedicated HTTP gateway; devnet content is read
+    // via public IPFS gateways.
+    devnet: {
+        label: "Devnet (Paseo testnet)",
+        assetHubWs: "wss://asset-hub-paseo-rpc.n.dwellir.com",
+        gateways: [
+            "https://ipfs.io/ipfs/",
+            "https://dweb.link/ipfs/",
+            "https://nftstorage.link/ipfs/",
+        ],
+        registry: "0x59b0245778917af55224e5f8fb55f7f8d452619f",
+        loadDescriptor: async () =>
+            (await import("@parity/product-sdk-descriptors/devnet-asset-hub")).devnet_asset_hub,
+    },
+};
+
+function resolveNetwork(): NetworkConfig {
+    const selected = (import.meta.env.VITE_NETWORK ?? "").trim().toLowerCase();
+    if (selected === "devnet") return NETWORKS.devnet;
+    if (selected && selected !== "paseo" && selected !== "paseo-next") {
+        console.warn(`[Network] Unknown VITE_NETWORK "${selected}", falling back to paseo-next`);
+    }
+    return NETWORKS["paseo-next"];
+}
+
+export const NETWORK = resolveNetwork();
 
 /**
  * Unwrap a product-sdk `Result` to its value, re-throwing the `err` channel as
@@ -351,16 +410,20 @@ async function ensureContractsReady(): Promise<void> {
         const isDevHost =
             typeof window !== "undefined" && /^localhost(:\d+)?$/.test(window.location.host);
 
+        const descriptor = await NETWORK.loadDescriptor();
+        const genesis = descriptor.genesis as `0x${string}` | undefined;
+        if (!genesis) throw new Error(`[CDM] ${NETWORK.label} descriptor is missing its genesis hash`);
+
         let provider = null;
         if (!isDevHost) {
             try {
-                provider = await getHostProvider(PASEO_ASSET_HUB_GENESIS);
+                provider = await getHostProvider(genesis);
             } catch (err) {
                 console.warn("[CDM] Host provider failed, falling back to WS:", err);
             }
         }
-        provider ??= getWsProvider(PASEO_ASSET_HUB_WS);
-        console.log(`[CDM] Asset Hub provider: ${isDevHost ? "direct WS (dev)" : "host with WS fallback (prod)"}`);
+        provider ??= getWsProvider(NETWORK.assetHubWs);
+        console.log(`[CDM] ${NETWORK.label} provider: ${isDevHost ? "direct WS (dev)" : "host with WS fallback (prod)"}`);
         _polkadotClient = createClient(provider);
 
         console.log("[CDM] Waking Asset Hub chain follow...");
@@ -368,16 +431,30 @@ async function ensureContractsReady(): Promise<void> {
         await _polkadotClient.getBestBlocks();
         console.log("[CDM] Chain follow active.");
 
-        _contractManager = ContractManager.fromClient(
-            _cdmJson,
-            _polkadotClient,
-            paseo_asset_hub,
-            _state.account
-                ? { defaultOrigin: _state.account.address as never, defaultSigner: _state.account.signer }
-                : undefined,
-        );
+        const defaults = _state.account
+            ? { defaultOrigin: _state.account.address as never, defaultSigner: _state.account.signer }
+            : undefined;
+        if (NETWORK.registry.toLowerCase() !== String(_cdmJson?.registry ?? "").toLowerCase()) {
+            // The cdm.json snapshot was produced against a different network's
+            // registry, so its static address is meaningless here — resolve the
+            // contract address live from this network's registry instead.
+            // registryOrigin: the registry lookup is a pallet-revive dry-run and
+            // needs a MAPPED origin. The connected account may not be mapped yet
+            // (mapping happens later, on the submit path), so pin the lookup to
+            // the SDK's always-mapped pallet-account fallback instead of letting
+            // it default to defaultOrigin.
+            const live = await ContractManager.fromLiveClient(_cdmJson, _polkadotClient, descriptor, {
+                ...defaults,
+                registryAddress: NETWORK.registry as never,
+                registryOrigin: QUERY_FALLBACK_ORIGIN,
+            });
+            if (!live.ok) throw live.error;
+            _contractManager = live.value;
+        } else {
+            _contractManager = ContractManager.fromClient(_cdmJson, _polkadotClient, descriptor, defaults);
+        }
         _contract = wrapContract(_contractManager.getContract(CONTRACT_KEY));
-        console.log("[CDM] Contract manager ready");
+        console.log(`[CDM] Contract manager ready (${NETWORK.label})`);
     })();
     return _contractInitPromise;
 }
@@ -454,12 +531,7 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
 // Bulletin reads via public IPFS gateways
 // ---------------------------------------------------------------------------
 
-const GATEWAYS = [
-    "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs/",
-    "https://dweb.link/ipfs/",
-    "https://ipfs.io/ipfs/",
-    "https://nftstorage.link/ipfs/",
-] as const;
+const GATEWAYS = NETWORK.gateways;
 
 export const IPFS_GATEWAY = GATEWAYS[0];
 

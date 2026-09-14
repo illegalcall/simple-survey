@@ -6,13 +6,13 @@ import {
     requestPermission,
     type AccountsProvider,
     type ProductAccount,
+    type HostSubscription,
 } from "@parity/product-sdk-host";
 import { ContractManager, QUERY_FALLBACK_ORIGIN, ensureContractAccountMapped } from "@parity/product-sdk-contracts";
 import type { devnet_asset_hub } from "@parity/product-sdk-descriptors/devnet-asset-hub";
 import type { paseo_asset_hub } from "@parity/product-sdk-descriptors/paseo-asset-hub";
 import { ss58ToH160 } from "@parity/product-sdk-address";
 import { createClient, AccountId, type PolkadotSigner } from "polkadot-api";
-import { getWsProvider } from "@polkadot-api/ws-provider";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { CID } from "multiformats/cid";
 import * as raw from "multiformats/codecs/raw";
@@ -35,9 +35,6 @@ type AssetHubDescriptor = typeof devnet_asset_hub | typeof paseo_asset_hub;
 
 interface NetworkConfig {
     label: string;
-    assetHubWs: string;
-    /** IPFS gateways used to read Bulletin content, most specific first. */
-    gateways: readonly string[];
     /** CDM ContractRegistry address the contract resolves against. */
     registry: string;
     loadDescriptor(): Promise<AssetHubDescriptor>;
@@ -52,26 +49,12 @@ export const NETWORK: NetworkConfig =
     import.meta.env.VITE_NETWORK === "devnet"
         ? {
               label: "Devnet (Paseo testnet)",
-              assetHubWs: "wss://asset-hub-paseo-rpc.n.dwellir.com",
-              // Bulletin Paseo has no dedicated HTTP gateway; read via public IPFS gateways.
-              gateways: [
-                  "https://ipfs.io/ipfs/",
-                  "https://dweb.link/ipfs/",
-                  "https://nftstorage.link/ipfs/",
-              ],
               registry: "0x59b0245778917af55224e5f8fb55f7f8d452619f",
               loadDescriptor: async () =>
                   (await import("@parity/product-sdk-descriptors/devnet-asset-hub")).devnet_asset_hub,
           }
         : {
               label: "Paseo Next",
-              assetHubWs: "wss://paseo-asset-hub-next-rpc.polkadot.io",
-              gateways: [
-                  "https://paseo-bulletin-next-ipfs.polkadot.io/ipfs/",
-                  "https://dweb.link/ipfs/",
-                  "https://ipfs.io/ipfs/",
-                  "https://nftstorage.link/ipfs/",
-              ],
               registry: "0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0",
               loadDescriptor: async () =>
                   (await import("@parity/product-sdk-descriptors/paseo-asset-hub")).paseo_asset_hub,
@@ -362,11 +345,15 @@ export async function wakeChainFollow(): Promise<void> {
 const NO_FOLLOW_RE = /no active follow/i;
 
 function withFollowRetry<T extends Record<string, any>>(method: T): T {
-    const wrap = <Fn extends (...a: any[]) => Promise<any>>(fn: Fn): Fn =>
+    const wrap = <Fn extends (...a: any[]) => Promise<any>>(fn: Fn, isTransaction: boolean): Fn =>
         (async (...args: any[]) => {
             await wakeChainFollow();
             try {
-                return await fn(...args);
+                const result = await fn(...args);
+                // SDK transaction failures are values; inspect them inside the
+                // retry boundary before getContract unwraps the final result.
+                if (isTransaction && result && result.ok === false) throw result.error;
+                return result;
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
                 if (!NO_FOLLOW_RE.test(msg)) throw err;
@@ -379,7 +366,7 @@ function withFollowRetry<T extends Record<string, any>>(method: T): T {
     return new Proxy(method, {
         get(target, prop) {
             const v = target[prop as keyof T];
-            if (typeof v === "function") return wrap(v.bind(target));
+            if (typeof v === "function") return wrap(v.bind(target), prop === "tx");
             return v;
         },
     });
@@ -403,29 +390,12 @@ async function ensureContractsReady(): Promise<void> {
     _contractInitPromise = (async () => {
         await ensurePermission("ChainSubmit");
 
-        // Asset Hub access:
-        //  - In dev (localhost) the host refuses to open a chain follow for the
-        //    unregistered domain. Bypass and go straight to WS.
-        //  - In a deployed `*.dot` app the host owns the follow; route through
-        //    the host provider so signing/permissions stay coordinated, and fall
-        //    back to WS if the host can't serve the chain.
-        const isDevHost =
-            typeof window !== "undefined" && /^localhost(:\d+)?$/.test(window.location.host);
-
         const descriptor = await NETWORK.loadDescriptor();
-        const genesis = descriptor.genesis as `0x${string}` | undefined;
-        if (!genesis) throw new Error(`[CDM] ${NETWORK.label} descriptor is missing its genesis hash`);
-
-        let provider = null;
-        if (!isDevHost) {
-            try {
-                provider = await getHostProvider(genesis);
-            } catch (err) {
-                console.warn("[CDM] Host provider failed, falling back to WS:", err);
-            }
+        const genesis = descriptor.genesis as `0x${string}`;
+        const provider = await getHostProvider(genesis);
+        if (!provider) {
+            throw new Error("Asset Hub is unavailable — open this app inside a Polkadot host that supports the selected chain.");
         }
-        provider ??= getWsProvider(NETWORK.assetHubWs);
-        console.log(`[CDM] ${NETWORK.label} provider: ${isDevHost ? "direct WS (dev)" : "host with WS fallback (prod)"}`);
         _polkadotClient = createClient(provider);
 
         console.log("[CDM] Waking Asset Hub chain follow...");
@@ -455,10 +425,25 @@ async function ensureContractsReady(): Promise<void> {
         } else {
             _contractManager = ContractManager.fromClient(_cdmJson, _polkadotClient, descriptor, defaults);
         }
+        // Sign-in can finish while the live registry lookup is pending.
+        // Publish the current account defaults, not the pre-lookup snapshot.
+        if (_state.account) {
+            _contractManager.setDefaults({ origin: _state.account.address, signer: _state.account.signer });
+        }
         _contract = wrapContract(_contractManager.getContract(CONTRACT_KEY));
         console.log(`[CDM] Contract manager ready (${NETWORK.label})`);
     })();
-    return _contractInitPromise;
+    try {
+        await _contractInitPromise;
+    } catch (error) {
+        _polkadotClient?.destroy();
+        _polkadotClient = null;
+        _contractManager = null;
+        _contract = null;
+        throw error;
+    } finally {
+        _contractInitPromise = null;
+    }
 }
 
 /**
@@ -530,33 +515,57 @@ export async function ensureMapping(account: AppAccount): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Bulletin reads via public IPFS gateways
+// Bulletin reads through the host preimage subscription
 // ---------------------------------------------------------------------------
 
-const GATEWAYS = NETWORK.gateways;
-
-export const IPFS_GATEWAY = GATEWAYS[0];
-
-export async function fetchFromGateway(cid: string, timeoutMs = 30000): Promise<Uint8Array> {
-    const master = new AbortController();
-    const timer = setTimeout(() => master.abort(), timeoutMs);
-    try {
-        const winner = await Promise.any(
-            GATEWAYS.map(async gw => {
-                const resp = await fetch(gw + cid, { signal: master.signal });
-                if (!resp.ok) throw new Error(`${gw} -> ${resp.status}`);
-                return new Uint8Array(await resp.arrayBuffer());
-            }),
-        );
-        master.abort();
-        return winner;
-    } finally {
-        clearTimeout(timer);
+export async function fetchFromBulletin(cid: string, timeoutMs = 30000): Promise<Uint8Array> {
+    const parsed = CID.parse(cid);
+    // Survey uploads use raw blocks with a BLAKE2b-256 digest (calculateCID).
+    if (parsed.code !== raw.code || parsed.multihash.code !== BLAKE2B_256_CODE || parsed.multihash.size !== 32) {
+        throw new Error("Unsupported survey CID: expected a raw BLAKE2b-256 block.");
     }
+    const key = `0x${Array.from(parsed.multihash.digest, byte => byte.toString(16).padStart(2, "0")).join("")}` as `0x${string}`;
+    const manager = await getPreimageManager();
+    if (!manager) throw new Error("Bulletin storage is unavailable — open this app inside a Polkadot host.");
+
+    return new Promise((resolve, reject) => {
+        let done = false;
+        let subscription: HostSubscription | undefined;
+        let removeInterrupt: (() => void) | undefined;
+        const cleanup = () => {
+            clearTimeout(timer);
+            removeInterrupt?.();
+            subscription?.unsubscribe();
+        };
+        const fail = (error: unknown) => {
+            if (done) return;
+            done = true;
+            cleanup();
+            reject(error);
+        };
+        const timer = setTimeout(() => fail(new Error("Bulletin read timed out")), timeoutMs);
+        try {
+            subscription = manager.lookup(key, (bytes) => {
+                if (done || bytes === null) return;
+                if (calculateCID(bytes) !== parsed.toString()) {
+                    fail(new Error("Bulletin content does not match the requested CID"));
+                    return;
+                }
+                done = true;
+                cleanup();
+                resolve(bytes);
+            });
+            removeInterrupt = subscription.onInterrupt(() => fail(new Error("Bulletin host connection interrupted")));
+            // A host may return its cached preimage synchronously during setup.
+            if (done) cleanup();
+        } catch (error) {
+            fail(error);
+        }
+    });
 }
 
 export async function fetchJsonFromBulletin<T = unknown>(cid: string): Promise<T> {
-    const bytes = await fetchFromGateway(cid);
+    const bytes = await fetchFromBulletin(cid);
     return JSON.parse(new TextDecoder().decode(bytes)) as T;
 }
 

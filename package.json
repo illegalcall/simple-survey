@@ -10,7 +10,8 @@
     "build:contracts": "cdm build",
     "deploy": "cdm deploy -n paseo --registry-address 0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0 --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io --bulletin-url wss://paseo-bulletin-next-rpc.polkadot.io && npm run install:contracts",
     "install:contracts": "cdm install -n paseo --registry-address 0xf62c2ece29cd8df2e10040ecfa5a894a5c5d9cb0 --assethub-url wss://paseo-asset-hub-next-rpc.polkadot.io --ipfs-gateway-url https://paseo-bulletin-next-ipfs.polkadot.io/ipfs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "@noble/hashes": "^2.2.0",
@@ -19,7 +20,6 @@
     "@parity/product-sdk-descriptors": "^0.8.0",
     "@parity/product-sdk-host": "^0.14.1",
     "@parity/product-sdk-tx": "^0.3.2",
-    "@polkadot-api/ws-provider": "^0.9.0",
     "multiformats": "^13.4.2",
     "polkadot-api": "^2.1.6",
     "react": "^19.0.0",
@@ -30,7 +30,8 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "^5.9.0",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.10"
   },
   "overrides": {
     "@polkadot-api/json-rpc-provider": "0.2.0"
